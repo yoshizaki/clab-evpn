@@ -9,6 +9,25 @@
 
 | 版 | 変更内容 |
 |---|---|
+| v2.2 | サーバ追加・802.1q VLAN tagging 対応 |
+| | server-clab2 (10.20.0.102) / server-fwd2 (10.100.0.202) 追加 |
+| | lag3/lag4 (ESI-BOND2/3) 追加 (leaf1: e1-5/e1-6, leaf2: e1-5/e1-6) |
+| | mac-vrf-clab に lag3.210, mac-vrf-fwd に lag4.220 追加 |
+| | topology.yaml: server-clab2/fwd2 ノード・リンク追加 |
+| | トポロジー図更新 (4サーバ構成) |
+| v2.2 | サーバ追加・802.1q VLAN tagging 対応 |
+| | server-clab2 (10.20.0.102/VLAN210/lag3/ES-BOND2) 追加 |
+| | server-fwd2 (10.100.0.202/VLAN220/lag4/ES-BOND3) 追加 |
+| | leaf1/leaf2: lag3/lag4 + ESI-BOND2/BOND3 追加 |
+| | mac-vrf-clab: lag3.210 追加 |
+| | mac-vrf-fwd: lag4.220 追加 |
+| v2.1 | 802.1q VLAN tagging 対応 |
+| | lag1: untagged → VLAN 210 (single-tagged) に変更 |
+| | lag2: untagged → VLAN 220 (single-tagged) に変更 |
+| | mac-vrf-clab: lag1.0 → lag1.210 に変更 |
+| | mac-vrf-fwd: lag2.0 → lag2.220 に変更 |
+| | server-clab: bond0 → bond0.210 (VLAN サブインターフェース) に変更 |
+| | server-fwd: bond0 → bond0.220 (VLAN サブインターフェース) に変更 |
 | v2.0 | ARP population 設定追加・Anycast GW + Type-2 MAC+IP 広告を完全動作確認 |
 | | leaf1/leaf2 irb0.210/220 に ARP population 設定追加 (Symmetric IRB必須) |
 | | `learn-unsolicited true` / `host-route populate dynamic` / `evpn advertise dynamic` |
@@ -89,22 +108,20 @@
 ## 1. 検証トポロジー概要
 
 ```
-                    [server-clab]          [server-fwd]
-                    10.20.0.101            10.100.0.201
-                    GW: 10.20.0.254        GW: 10.100.0.254
-                    (tenant-clab)          (tenant-fwd)
-                         │                      │
-               ESI-LAG bond0 (lag1)    ESI-LAG bond0 (lag2)
-          ┌────────╱╲────────┐      ┌────────╱╲────────┐
-          │  lag1 ESI-BOND0  │      │  lag2 ESI-BOND1  │
-          │                  │      │                  │
-       leaf1               leaf2  leaf1              leaf2
-       D2L-1               D2L-2
-       AS 65101            AS 65102
-       Lo: 10.0.1.1        Lo: 10.0.1.2
-       IRB: 10.20.0.1      IRB: 10.20.0.2
-       IRB: 10.100.0.1     IRB: 10.100.0.2
-       Anycast: 10.20.0.254/10.100.0.254 (両Leaf共通)
+           [server-clab]       [server-clab2]    [server-fwd]      [server-fwd2]
+           10.20.0.101         10.20.0.102        10.100.0.201      10.100.0.202
+           GW:10.20.0.254      GW:10.20.0.254     GW:10.100.0.254   GW:10.100.0.254
+           (tenant-clab)       (tenant-clab)      (tenant-fwd)      (tenant-fwd)
+                │                   │                  │                  │
+        ESI-LAG bond0.210   ESI-LAG bond0.210  ESI-LAG bond0.220  ESI-LAG bond0.220
+        (lag1/ES-BOND0)     (lag3/ES-BOND2)    (lag2/ES-BOND1)    (lag4/ES-BOND3)
+          ┌────╱╲────┐         ┌────╱╲────┐     ┌────╱╲────┐       ┌────╱╲────┐
+          │          │         │          │     │          │       │          │
+       leaf1       leaf2    leaf1       leaf2 leaf1      leaf2  leaf1       leaf2
+       D2L-1       D2L-2
+       AS 65101    AS 65102
+       Lo:10.0.1.1 Lo:10.0.1.2
+       Anycast GW: 10.20.0.254 / 10.100.0.254 (両Leaf共通)
           │  ╲            ╱  │
           │   ╲          ╱   │
           │    ╲ 100G  100G  │
@@ -120,9 +137,11 @@ P2Pリンク:
   spine2 eth1/1 ↔ leaf1 eth1/2 : 10.1.0.4/31
   spine2 eth1/2 ↔ leaf2 eth1/2 : 10.1.0.6/31
 
-アクセスポート:
-  leaf1 eth1/3 + leaf2 eth1/3 → server-clab (ESI-LAG lag1 / tenant-clab-vrf)
-  leaf1 eth1/4 + leaf2 eth1/4 → server-fwd  (ESI-LAG lag2 / tenant-fwd-vrf)
+アクセスポート (802.1q trunk):
+  leaf1 e1-3 + leaf2 e1-3 → server-clab  (lag1/ES-BOND0 / VLAN 210 / tenant-clab-vrf)
+  leaf1 e1-4 + leaf2 e1-4 → server-fwd   (lag2/ES-BOND1 / VLAN 220 / tenant-fwd-vrf)
+  leaf1 e1-5 + leaf2 e1-5 → server-clab2 (lag3/ES-BOND2 / VLAN 210 / tenant-clab-vrf)
+  leaf1 e1-6 + leaf2 e1-6 → server-fwd2  (lag4/ES-BOND3 / VLAN 220 / tenant-fwd-vrf)
 ```
 
 ### VNI割り当て (設計書 §3.2 準拠)
@@ -326,8 +345,11 @@ topology:
         - bash -c "ip link set eth1 down && ip link set eth1 master bond0"
         - bash -c "ip link set eth2 down && ip link set eth2 master bond0"
         - ip link set bond0 up
-        - ip addr add 10.20.0.101/16 dev bond0
-        - ip route replace default via 10.20.0.254
+        # 802.1q VLAN 210 サブインターフェース作成
+        - ip link add link bond0 name bond0.210 type vlan id 210
+        - ip link set bond0.210 up
+        - ip addr add 10.20.0.101/16 dev bond0.210
+        - ip route replace default via 10.20.0.254 dev bond0.210
         - bash -c "echo 'nameserver 10.20.0.10' > /etc/resolv.conf"
 
     # tenant-fwd-vrf テスト用 (ESI-LAG All-Active)
@@ -346,8 +368,55 @@ topology:
         - bash -c "ip link set eth1 down && ip link set eth1 master bond0"
         - bash -c "ip link set eth2 down && ip link set eth2 master bond0"
         - ip link set bond0 up
-        - ip addr add 10.100.0.201/24 dev bond0
-        - ip route replace default via 10.100.0.254
+        # 802.1q VLAN 220 サブインターフェース作成
+        - ip link add link bond0 name bond0.220 type vlan id 220
+        - ip link set bond0.220 up
+        - ip addr add 10.100.0.201/24 dev bond0.220
+        - ip route replace default via 10.100.0.254 dev bond0.220
+        - bash -c "echo 'nameserver 10.20.0.10' > /etc/resolv.conf"
+
+    # tenant-clab-vrf 追加サーバ (10.20.0.102 / lag3 / ESI-BOND2)
+    server-clab2:
+      kind: linux
+      mgmt-ipv4: 172.20.20.103
+      cap-add:
+        - NET_ADMIN
+        - SYS_ADMIN
+        - NET_RAW
+      exec:
+        - sleep 5
+        - ip link add bond0 type bond mode 802.3ad
+        - ip link set bond0 type bond miimon 100 lacp_rate fast
+        - bash -c "ip link set eth1 down && ip link set eth1 master bond0"
+        - bash -c "ip link set eth2 down && ip link set eth2 master bond0"
+        - ip link set bond0 up
+        # 802.1q VLAN 210 サブインターフェース作成
+        - ip link add link bond0 name bond0.210 type vlan id 210
+        - ip link set bond0.210 up
+        - ip addr add 10.20.0.102/16 dev bond0.210
+        - ip route replace default via 10.20.0.254 dev bond0.210
+        - bash -c "echo 'nameserver 10.20.0.10' > /etc/resolv.conf"
+
+    # tenant-fwd-vrf 追加サーバ (10.100.0.202 / lag4 / ESI-BOND3)
+    server-fwd2:
+      kind: linux
+      mgmt-ipv4: 172.20.20.104
+      cap-add:
+        - NET_ADMIN
+        - SYS_ADMIN
+        - NET_RAW
+      exec:
+        - sleep 5
+        - ip link add bond0 type bond mode 802.3ad
+        - ip link set bond0 type bond miimon 100 lacp_rate fast
+        - bash -c "ip link set eth1 down && ip link set eth1 master bond0"
+        - bash -c "ip link set eth2 down && ip link set eth2 master bond0"
+        - ip link set bond0 up
+        # 802.1q VLAN 220 サブインターフェース作成
+        - ip link add link bond0 name bond0.220 type vlan id 220
+        - ip link set bond0.220 up
+        - ip addr add 10.100.0.202/24 dev bond0.220
+        - ip route replace default via 10.100.0.254 dev bond0.220
         - bash -c "echo 'nameserver 10.20.0.10' > /etc/resolv.conf"
 
   links:
@@ -365,17 +434,21 @@ topology:
     - endpoints: ["spine2:e1-2", "leaf2:e1-2"]
 
     # ===== Server Access Links =====
-    # server-clab → leaf1 (ESI-LAG member / lag1)
+    # server-clab → leaf1/leaf2 (ESI-LAG lag1 / VLAN 210)
     - endpoints: ["leaf1:e1-3", "server-clab:eth1"]
-
-    # server-clab → leaf2 (ESI-LAG member / lag1)
     - endpoints: ["leaf2:e1-3", "server-clab:eth2"]
 
-    # server-fwd → leaf1 (access / tenant-fwd-vrf)
+    # server-fwd → leaf1/leaf2 (ESI-LAG lag2 / VLAN 220)
     - endpoints: ["leaf1:e1-4", "server-fwd:eth1"]
-
-    # server-fwd → leaf2 (access / tenant-fwd-vrf) ※Route-leak検証用
     - endpoints: ["leaf2:e1-4", "server-fwd:eth2"]
+
+    # server-clab2 → leaf1/leaf2 (ESI-LAG lag3 / VLAN 210)
+    - endpoints: ["leaf1:e1-5", "server-clab2:eth1"]
+    - endpoints: ["leaf2:e1-5", "server-clab2:eth2"]
+
+    # server-fwd2 → leaf1/leaf2 (ESI-LAG lag4 / VLAN 220)
+    - endpoints: ["leaf1:e1-6", "server-fwd2:eth1"]
+    - endpoints: ["leaf2:e1-6", "server-fwd2:eth2"]
 ```
 
 ---
@@ -620,16 +693,19 @@ set / interface ethernet-1/2 subinterface 0 ipv4 address 10.1.0.5/31
 # =============================================
 # ESI-LAG: ethernet-1/3 → server-clab (lag1)
 # ESI: 00:11:22:33:44:55:66:77:88:01 (bond0)
+# 802.1q trunk: VLAN 210 (tenant-clab)
 # =============================================
 set / interface lag1 admin-state enable
 set / interface lag1 description "ESI-LAG to server-clab"
+set / interface lag1 vlan-tagging true
 set / interface lag1 lag lag-type lacp
 set / interface lag1 lag lacp interval FAST
 set / interface lag1 lag lacp lacp-mode ACTIVE
 set / interface lag1 lag lacp system-id-mac 00:11:22:33:44:00
 set / interface lag1 lag lacp admin-key 1
-set / interface lag1 subinterface 0 admin-state enable
-set / interface lag1 subinterface 0 type bridged
+set / interface lag1 subinterface 210 admin-state enable
+set / interface lag1 subinterface 210 type bridged
+set / interface lag1 subinterface 210 vlan encap single-tagged vlan-id 210
 
 set / interface ethernet-1/3 admin-state enable
 set / interface ethernet-1/3 description "ESI-LAG member to server-clab"
@@ -638,20 +714,65 @@ set / interface ethernet-1/3 ethernet aggregate-id lag1
 # =============================================
 # ESI-LAG: ethernet-1/4 → server-fwd (lag2)
 # ESI: 00:11:22:33:44:55:66:77:88:02 (bond0)
+# 802.1q trunk: VLAN 220 (tenant-fwd)
 # =============================================
 set / interface lag2 admin-state enable
 set / interface lag2 description "ESI-LAG to server-fwd"
+set / interface lag2 vlan-tagging true
 set / interface lag2 lag lag-type lacp
 set / interface lag2 lag lacp interval FAST
 set / interface lag2 lag lacp lacp-mode ACTIVE
 set / interface lag2 lag lacp system-id-mac 00:11:22:33:44:00
 set / interface lag2 lag lacp admin-key 2
-set / interface lag2 subinterface 0 admin-state enable
-set / interface lag2 subinterface 0 type bridged
+set / interface lag2 subinterface 220 admin-state enable
+set / interface lag2 subinterface 220 type bridged
+set / interface lag2 subinterface 220 vlan encap single-tagged vlan-id 220
 
 set / interface ethernet-1/4 admin-state enable
 set / interface ethernet-1/4 description "ESI-LAG member to server-fwd"
 set / interface ethernet-1/4 ethernet aggregate-id lag2
+
+# =============================================
+# ESI-LAG: ethernet-1/5 → server-clab2 (lag3)
+# ESI: 00:11:22:33:44:55:66:77:88:03 (bond0)
+# 802.1q trunk: VLAN 210 (tenant-clab)
+# =============================================
+set / interface lag3 admin-state enable
+set / interface lag3 description "ESI-LAG to server-clab2"
+set / interface lag3 vlan-tagging true
+set / interface lag3 lag lag-type lacp
+set / interface lag3 lag lacp interval FAST
+set / interface lag3 lag lacp lacp-mode ACTIVE
+set / interface lag3 lag lacp system-id-mac 00:11:22:33:55:00
+set / interface lag3 lag lacp admin-key 3
+set / interface lag3 subinterface 210 admin-state enable
+set / interface lag3 subinterface 210 type bridged
+set / interface lag3 subinterface 210 vlan encap single-tagged vlan-id 210
+
+set / interface ethernet-1/5 admin-state enable
+set / interface ethernet-1/5 description "ESI-LAG member to server-clab2"
+set / interface ethernet-1/5 ethernet aggregate-id lag3
+
+# =============================================
+# ESI-LAG: ethernet-1/6 → server-fwd2 (lag4)
+# ESI: 00:11:22:33:44:55:66:77:88:04 (bond0)
+# 802.1q trunk: VLAN 220 (tenant-fwd)
+# =============================================
+set / interface lag4 admin-state enable
+set / interface lag4 description "ESI-LAG to server-fwd2"
+set / interface lag4 vlan-tagging true
+set / interface lag4 lag lag-type lacp
+set / interface lag4 lag lacp interval FAST
+set / interface lag4 lag lacp lacp-mode ACTIVE
+set / interface lag4 lag lacp system-id-mac 00:11:22:33:66:00
+set / interface lag4 lag lacp admin-key 4
+set / interface lag4 subinterface 220 admin-state enable
+set / interface lag4 subinterface 220 type bridged
+set / interface lag4 subinterface 220 vlan encap single-tagged vlan-id 220
+
+set / interface ethernet-1/6 admin-state enable
+set / interface ethernet-1/6 description "ESI-LAG member to server-fwd2"
+set / interface ethernet-1/6 ethernet aggregate-id lag4
 
 # =============================================
 # VXLAN Tunnel Interface
@@ -723,7 +844,8 @@ set / network-instance default interface ethernet-1/2.0
 set / network-instance mac-vrf-clab type mac-vrf
 set / network-instance mac-vrf-clab admin-state enable
 set / network-instance mac-vrf-clab description "tenant-clab-vrf L2 domain"
-set / network-instance mac-vrf-clab interface lag1.0
+set / network-instance mac-vrf-clab interface lag1.210
+set / network-instance mac-vrf-clab interface lag3.210
 set / network-instance mac-vrf-clab interface irb0.210
 set / network-instance mac-vrf-clab vxlan-interface vxlan0.50020
 
@@ -753,7 +875,8 @@ set / network-instance mac-vrf-clab protocols bgp-vpn bgp-instance 1 route-targe
 set / network-instance mac-vrf-fwd type mac-vrf
 set / network-instance mac-vrf-fwd admin-state enable
 set / network-instance mac-vrf-fwd description "tenant-fwd-vrf L2 domain"
-set / network-instance mac-vrf-fwd interface lag2.0
+set / network-instance mac-vrf-fwd interface lag2.220
+set / network-instance mac-vrf-fwd interface lag4.220
 set / network-instance mac-vrf-fwd interface irb0.220
 set / network-instance mac-vrf-fwd vxlan-interface vxlan0.50030
 
@@ -878,6 +1001,18 @@ set / system network-instance protocols evpn ethernet-segments bgp-instance 1 et
 set / system network-instance protocols evpn ethernet-segments bgp-instance 1 ethernet-segment ES-BOND1 multi-homing-mode all-active
 set / system network-instance protocols evpn ethernet-segments bgp-instance 1 ethernet-segment ES-BOND1 interface lag2
 
+set / system network-instance protocols evpn ethernet-segments bgp-instance 1 ethernet-segment ES-BOND2
+set / system network-instance protocols evpn ethernet-segments bgp-instance 1 ethernet-segment ES-BOND2 admin-state enable
+set / system network-instance protocols evpn ethernet-segments bgp-instance 1 ethernet-segment ES-BOND2 esi 00:11:22:33:44:55:66:77:88:03
+set / system network-instance protocols evpn ethernet-segments bgp-instance 1 ethernet-segment ES-BOND2 multi-homing-mode all-active
+set / system network-instance protocols evpn ethernet-segments bgp-instance 1 ethernet-segment ES-BOND2 interface lag3
+
+set / system network-instance protocols evpn ethernet-segments bgp-instance 1 ethernet-segment ES-BOND3
+set / system network-instance protocols evpn ethernet-segments bgp-instance 1 ethernet-segment ES-BOND3 admin-state enable
+set / system network-instance protocols evpn ethernet-segments bgp-instance 1 ethernet-segment ES-BOND3 esi 00:11:22:33:44:55:66:77:88:04
+set / system network-instance protocols evpn ethernet-segments bgp-instance 1 ethernet-segment ES-BOND3 multi-homing-mode all-active
+set / system network-instance protocols evpn ethernet-segments bgp-instance 1 ethernet-segment ES-BOND3 interface lag4
+
 # BGP EVPN 全体設定 (system レベル)
 set / system network-instance protocols bgp-vpn bgp-instance 1
 
@@ -926,34 +1061,76 @@ set / interface ethernet-1/2 subinterface 0 ipv4 admin-state enable
 set / interface ethernet-1/2 subinterface 0 ipv4 address 10.1.0.7/31
 
 # --- ESI-LAG: ethernet-1/3 → server-clab (lag1, 同一ESI) ---
+# 802.1q trunk: VLAN 210 (tenant-clab)
 set / interface lag1 admin-state enable
 set / interface lag1 description "ESI-LAG to server-clab"
+set / interface lag1 vlan-tagging true
 set / interface lag1 lag lag-type lacp
 set / interface lag1 lag lacp interval FAST
 set / interface lag1 lag lacp lacp-mode ACTIVE
 set / interface lag1 lag lacp system-id-mac 00:11:22:33:44:00
 set / interface lag1 lag lacp admin-key 1
-set / interface lag1 subinterface 0 admin-state enable
-set / interface lag1 subinterface 0 type bridged
+set / interface lag1 subinterface 210 admin-state enable
+set / interface lag1 subinterface 210 type bridged
+set / interface lag1 subinterface 210 vlan encap single-tagged vlan-id 210
 
 set / interface ethernet-1/3 admin-state enable
 set / interface ethernet-1/3 description "ESI-LAG member to server-clab"
 set / interface ethernet-1/3 ethernet aggregate-id lag1
 
 # --- ESI-LAG: ethernet-1/4 → server-fwd (lag2, 同一ESI) ---
+# 802.1q trunk: VLAN 220 (tenant-fwd)
 set / interface lag2 admin-state enable
 set / interface lag2 description "ESI-LAG to server-fwd"
+set / interface lag2 vlan-tagging true
 set / interface lag2 lag lag-type lacp
 set / interface lag2 lag lacp interval FAST
 set / interface lag2 lag lacp lacp-mode ACTIVE
 set / interface lag2 lag lacp system-id-mac 00:11:22:33:44:00
 set / interface lag2 lag lacp admin-key 2
-set / interface lag2 subinterface 0 admin-state enable
-set / interface lag2 subinterface 0 type bridged
+set / interface lag2 subinterface 220 admin-state enable
+set / interface lag2 subinterface 220 type bridged
+set / interface lag2 subinterface 220 vlan encap single-tagged vlan-id 220
 
 set / interface ethernet-1/4 admin-state enable
 set / interface ethernet-1/4 description "ESI-LAG member to server-fwd"
 set / interface ethernet-1/4 ethernet aggregate-id lag2
+
+# --- ESI-LAG: ethernet-1/5 → server-clab2 (lag3, 同一ESI) ---
+# 802.1q trunk: VLAN 210 (tenant-clab)
+set / interface lag3 admin-state enable
+set / interface lag3 description "ESI-LAG to server-clab2"
+set / interface lag3 vlan-tagging true
+set / interface lag3 lag lag-type lacp
+set / interface lag3 lag lacp interval FAST
+set / interface lag3 lag lacp lacp-mode ACTIVE
+set / interface lag3 lag lacp system-id-mac 00:11:22:33:55:00
+set / interface lag3 lag lacp admin-key 3
+set / interface lag3 subinterface 210 admin-state enable
+set / interface lag3 subinterface 210 type bridged
+set / interface lag3 subinterface 210 vlan encap single-tagged vlan-id 210
+
+set / interface ethernet-1/5 admin-state enable
+set / interface ethernet-1/5 description "ESI-LAG member to server-clab2"
+set / interface ethernet-1/5 ethernet aggregate-id lag3
+
+# --- ESI-LAG: ethernet-1/6 → server-fwd2 (lag4, 同一ESI) ---
+# 802.1q trunk: VLAN 220 (tenant-fwd)
+set / interface lag4 admin-state enable
+set / interface lag4 description "ESI-LAG to server-fwd2"
+set / interface lag4 vlan-tagging true
+set / interface lag4 lag lag-type lacp
+set / interface lag4 lag lacp interval FAST
+set / interface lag4 lag lacp lacp-mode ACTIVE
+set / interface lag4 lag lacp system-id-mac 00:11:22:33:66:00
+set / interface lag4 lag lacp admin-key 4
+set / interface lag4 subinterface 220 admin-state enable
+set / interface lag4 subinterface 220 type bridged
+set / interface lag4 subinterface 220 vlan encap single-tagged vlan-id 220
+
+set / interface ethernet-1/6 admin-state enable
+set / interface ethernet-1/6 description "ESI-LAG member to server-fwd2"
+set / interface ethernet-1/6 ethernet aggregate-id lag4
 
 # --- VXLAN ---
 
@@ -1006,7 +1183,8 @@ set / network-instance default interface ethernet-1/2.0
 
 set / network-instance mac-vrf-clab type mac-vrf
 set / network-instance mac-vrf-clab admin-state enable
-set / network-instance mac-vrf-clab interface lag1.0
+set / network-instance mac-vrf-clab interface lag1.210
+set / network-instance mac-vrf-clab interface lag3.210
 set / network-instance mac-vrf-clab interface irb0.210
 set / network-instance mac-vrf-clab vxlan-interface vxlan0.50020
 
@@ -1028,7 +1206,8 @@ set / network-instance mac-vrf-clab protocols bgp-vpn bgp-instance 1 route-targe
 
 set / network-instance mac-vrf-fwd type mac-vrf
 set / network-instance mac-vrf-fwd admin-state enable
-set / network-instance mac-vrf-fwd interface lag2.0
+set / network-instance mac-vrf-fwd interface lag2.220
+set / network-instance mac-vrf-fwd interface lag4.220
 set / network-instance mac-vrf-fwd interface irb0.220
 set / network-instance mac-vrf-fwd vxlan-interface vxlan0.50030
 
@@ -1131,6 +1310,18 @@ set / system network-instance protocols evpn ethernet-segments bgp-instance 1 et
 set / system network-instance protocols evpn ethernet-segments bgp-instance 1 ethernet-segment ES-BOND1 esi 00:11:22:33:44:55:66:77:88:02
 set / system network-instance protocols evpn ethernet-segments bgp-instance 1 ethernet-segment ES-BOND1 multi-homing-mode all-active
 set / system network-instance protocols evpn ethernet-segments bgp-instance 1 ethernet-segment ES-BOND1 interface lag2
+
+set / system network-instance protocols evpn ethernet-segments bgp-instance 1 ethernet-segment ES-BOND2
+set / system network-instance protocols evpn ethernet-segments bgp-instance 1 ethernet-segment ES-BOND2 admin-state enable
+set / system network-instance protocols evpn ethernet-segments bgp-instance 1 ethernet-segment ES-BOND2 esi 00:11:22:33:44:55:66:77:88:03
+set / system network-instance protocols evpn ethernet-segments bgp-instance 1 ethernet-segment ES-BOND2 multi-homing-mode all-active
+set / system network-instance protocols evpn ethernet-segments bgp-instance 1 ethernet-segment ES-BOND2 interface lag3
+
+set / system network-instance protocols evpn ethernet-segments bgp-instance 1 ethernet-segment ES-BOND3
+set / system network-instance protocols evpn ethernet-segments bgp-instance 1 ethernet-segment ES-BOND3 admin-state enable
+set / system network-instance protocols evpn ethernet-segments bgp-instance 1 ethernet-segment ES-BOND3 esi 00:11:22:33:44:55:66:77:88:04
+set / system network-instance protocols evpn ethernet-segments bgp-instance 1 ethernet-segment ES-BOND3 multi-homing-mode all-active
+set / system network-instance protocols evpn ethernet-segments bgp-instance 1 ethernet-segment ES-BOND3 interface lag4
 
 set / system network-instance protocols bgp-vpn bgp-instance 1
 

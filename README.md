@@ -1966,9 +1966,11 @@ show interface all                              # 全インターフェース
 show network-instance summary                   # 全NI一覧
 
 # --- BGP デバッグ ---
-show network-instance default protocols bgp neighbor summary
+show network-instance default protocols bgp summary
 show network-instance default protocols bgp neighbor <IP> detail
-show network-instance default protocols bgp rib-in-out <IP> evpn
+show network-instance default protocols bgp neighbor <IP> advertised-routes evpn
+show network-instance default protocols bgp neighbor <IP> received-routes evpn
+show network-instance default protocols bgp routes evpn route-type summary
 
 # --- EVPN デバッグ ---
 show network-instance <NI> protocols bgp-evpn routes summary

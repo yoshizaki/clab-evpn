@@ -1,35 +1,3 @@
-```
-A:root@leaf1# show network-instance default protocols bgp neighbor <peer-address:*>
-usage: neighbor [<peer-address>]
-
-Positional arguments:
-  peer-address
-
-Local commands:
-  advertised-routes
-  detail
-  maintenance
-  received-routes
-
-*** Not all commands are listed, press '?' again to see all options ***
-```
-
-```
-A:root@leaf1# show network-instance default protocols bgp rib-in-out
-
-
---{ + running }--[  ]--
-A:root@leaf1# show network-instance default protocols bgp
-usage: bgp
-
-Local commands:
-  neighbor
-  routes
-  summary
-
-*** Not all commands are listed, press '?' again to see all options ***
-```
-
 ## --- BGP デバッグ ---
 
 ```

@@ -9,18 +9,21 @@
 
 | 版 | 変更内容 |
 |---|---|
-| v2.2 | サーバ追加・802.1q VLAN tagging 対応 |
-| | server-clab2 (10.20.0.102) / server-fwd2 (10.100.0.202) 追加 |
-| | lag3/lag4 (ESI-BOND2/3) 追加 (leaf1: e1-5/e1-6, leaf2: e1-5/e1-6) |
-| | mac-vrf-clab に lag3.210, mac-vrf-fwd に lag4.220 追加 |
-| | topology.yaml: server-clab2/fwd2 ノード・リンク追加 |
-| | トポロジー図更新 (4サーバ構成) |
+| v2.4 | MTU 設計詳細化 |
+| | Section 14.3: Interface MTU / IP MTU の違いを説明追加 |
+| | Section 14.3: VLAN tag オーバーヘッド考慮した MTU スタック詳細化 |
+| | Section 14.4: P2P (9214) / LAG VLAN (9210) / IRB (9000) の設定値を明確化 |
+| | Section 14.5: Proxmox bond0/VLAN MTU 設定を詳細化 (bond0: 9000, bond0.210: 8996) |
+| v2.3 | Proxmox 物理環境向け設定追加・デバッグコマンド修正 |
+| | Section 13.2: VXLAN デバッグコマンド修正 |
+| | Section 13.2: ARP テーブル・LAG 確認コマンド追加 |
+| | Section 14 新規: Proxmox (Debian) Bonding/VLAN/MTU 設定手順 |
+| | MTU スタック設計 (物理 9000 → Pod 8850) を記載 |
 | v2.2 | サーバ追加・802.1q VLAN tagging 対応 |
 | | server-clab2 (10.20.0.102/VLAN210/lag3/ES-BOND2) 追加 |
 | | server-fwd2 (10.100.0.202/VLAN220/lag4/ES-BOND3) 追加 |
 | | leaf1/leaf2: lag3/lag4 + ESI-BOND2/BOND3 追加 |
-| | mac-vrf-clab: lag3.210 追加 |
-| | mac-vrf-fwd: lag4.220 追加 |
+| | mac-vrf-clab: lag3.210 追加 / mac-vrf-fwd: lag4.220 追加 |
 | v2.1 | 802.1q VLAN tagging 対応 |
 | | lag1: untagged → VLAN 210 (single-tagged) に変更 |
 | | lag2: untagged → VLAN 220 (single-tagged) に変更 |
@@ -1973,10 +1976,18 @@ show network-instance <NI> protocols bgp-evpn routes type <1-5> detail
 show network-instance <NI> protocols bgp-evpn multicast-destinations
 
 # --- VXLAN デバッグ ---
-show tunnel-interface vxlan0 detail
+show tunnel-interface vxlan0 vxlan-interface <vni> detail
 show network-instance <NI> vxlan-interface detail
-show network-instance <NI> bridge-table mac-table
-show network-instance <NI> bridge-table mac-table detail
+show network-instance <NI> bridge-table mac-table all
+show network-instance <NI> bridge-table mac-table mac <MAC>
+
+# ARP テーブル確認
+show arpnd arp-entries interface irb0 subinterface <subif-id>
+
+# LAG 詳細確認
+show lag <lagN> lacp-state
+show lag <lagN> lacp-statistics
+show lag <lagN> member-statistics
 
 # --- ESI-LAG デバッグ ---
 show system network-instance protocols evpn ethernet-segments summary
@@ -2056,6 +2067,208 @@ sudo containerlab destroy --topo topology.yaml --cleanup
 # 設定を保持して停止のみ
 docker stop $(docker ps -q -f "name=clab-bgp-evpn-vxlan")
 ```
+
+---
+
+## 14. Proxmox (Debian) 物理環境向け設定手順
+
+ContainerLab 検証で確認した構成を物理 Proxmox 環境に適用する際の手順です。
+
+### 14.1 前提条件
+
+```
+- Proxmox VE 8.x (Debian 12 Bookworm ベース)
+- NIC: 2ポート以上 (bonding 用)
+- スイッチ: Nokia 7220 IXR-D2L (Leaf)
+- LACP 対応スイッチ
+```
+
+### 14.2 Bonding Interface 設定 (LACP)
+
+Proxmox では `/etc/network/interfaces` で設定します。
+
+```bash
+# 必要パッケージのインストール
+apt install -y ifenslave vlan
+
+# カーネルモジュールの永続化
+echo "bonding" >> /etc/modules
+echo "8021q" >> /etc/modules
+modprobe bonding
+modprobe 8021q
+```
+
+`/etc/network/interfaces` に以下を追加：
+
+```
+# 物理 NIC (LAG メンバー)
+auto ens3f0
+iface ens3f0 inet manual
+    bond-master bond0
+
+auto ens3f1
+iface ens3f1 inet manual
+    bond-master bond0
+
+# LACP Bonding Interface
+auto bond0
+iface bond0 inet manual
+    bond-slaves ens3f0 ens3f1
+    bond-mode 802.3ad
+    bond-miimon 100
+    bond-lacp-rate fast
+    bond-xmit-hash-policy layer2
+    mtu 9000
+
+# VLAN 210 (tenant-clab-vrf)
+auto bond0.210
+iface bond0.210 inet static
+    address 10.20.0.101/16
+    gateway 10.20.0.254
+    vlan-raw-device bond0
+    mtu 8950
+
+# VLAN 220 (tenant-fwd-vrf)
+auto bond0.220
+iface bond0.220 inet static
+    address 10.100.0.201/24
+    gateway 10.100.0.254
+    vlan-raw-device bond0
+    mtu 8950
+```
+
+```bash
+# 設定反映
+systemctl restart networking
+
+# 確認
+ip link show bond0
+ip link show bond0.210
+cat /proc/net/bonding/bond0
+```
+
+### 14.3 MTU 設計
+
+SR-Linux では Interface MTU (L2) と IP MTU (L3) が独立して管理されます：
+
+```
+Interface MTU: 9232 (L2 フレーム全体 / SR-Linux デフォルト)
+  内訳:
+  - Ethernet header:  14 bytes
+  - VLAN tag:          4 bytes (802.1q の場合)
+  - IP Payload:     9214 bytes (VLAN なし) / 9210 bytes (VLAN あり)
+  - FCS:               4 bytes (MTU には含まない)
+```
+
+物理環境での MTU スタック：
+
+```
+物理 NIC (Interface MTU): 9232
+  │
+  ├── P2P Underlay (null encap)
+  │     IP MTU: 9214  (9232 - 14 Ethernet header - 4 FCS)
+  │
+  ├── LAG アクセスポート (single-tagged VLAN 210/220)
+  │     IP MTU: 9210  (9214 - 4 VLAN tag)
+  │
+  └── IRB (VXLAN オーバーヘッド考慮)
+        IP MTU: 9000  (余裕を持たせた推奨値)
+          - VXLAN overhead: 50 bytes
+            (Outer ETH 14 + Outer IP 20 + UDP 8 + VXLAN header 8)
+          = Inner payload: 9050 bytes 確保
+
+サーバ側 MTU スタック:
+  物理 NIC:     9000
+  bond0:        9000
+  bond0.210:    8996  (-4: VLAN tag)
+  │
+  EVPN VXLAN:   8946  (-50: VXLAN header)
+  k8s VXLAN:    8896  (-50: k8s VXLAN)
+  Pod MTU:      8896  ← 十分な MTU を確保
+```
+
+### 14.4 SR-Linux Leaf の MTU 設定
+
+物理環境では以下を cfg に追加します：
+
+```
+# leaf1/leaf2 共通
+
+# P2P Underlay subinterface (null encap / VLAN タグなし)
+set / interface ethernet-1/1 subinterface 0 ip-mtu 9214
+set / interface ethernet-1/2 subinterface 0 ip-mtu 9214
+
+# LAG subinterface (single-tagged VLAN / VLAN tag 4 byte 分を減算)
+set / interface lag1 subinterface 210 ip-mtu 9210
+set / interface lag2 subinterface 220 ip-mtu 9210
+set / interface lag3 subinterface 210 ip-mtu 9210
+set / interface lag4 subinterface 220 ip-mtu 9210
+
+# IRB ip-mtu (VXLAN オーバーヘッド 50 bytes 考慮)
+set / interface irb0 subinterface 210 ip-mtu 9000
+set / interface irb0 subinterface 220 ip-mtu 9000
+```
+
+### 14.5 Proxmox VM の NIC MTU 設定
+
+VM 内でも MTU を合わせます。bond0 の MTU から VLAN tag (4 bytes) を引いた値を設定します：
+
+```bash
+# VM 内 (Debian/Ubuntu)
+# bond0: 9000
+ip link set bond0 mtu 9000
+# bond0.210: 9000 - 4 (VLAN tag) = 8996
+ip link set bond0.210 mtu 8996
+```
+
+永続化 (`/etc/network/interfaces`)：
+
+```
+# bond0 MTU
+auto bond0
+iface bond0 inet manual
+    bond-slaves ens3f0 ens3f1
+    bond-mode 802.3ad
+    bond-miimon 100
+    bond-lacp-rate fast
+    mtu 9000
+
+# VLAN 210 (bond0 MTU 9000 - VLAN tag 4 = 8996)
+auto bond0.210
+iface bond0.210 inet static
+    address 10.20.0.101/16
+    gateway 10.20.0.254
+    vlan-raw-device bond0
+    mtu 8996
+
+# VLAN 220 (bond0 MTU 9000 - VLAN tag 4 = 8996)
+auto bond0.220
+iface bond0.220 inet static
+    address 10.100.0.201/24
+    gateway 10.100.0.254
+    vlan-raw-device bond0
+    mtu 8996
+```
+
+### 14.6 MTU 確認コマンド
+
+```bash
+# Proxmox ホスト側
+ip link show bond0 | grep mtu
+ip link show bond0.210 | grep mtu
+cat /proc/net/bonding/bond0 | grep -E "Mode|Status|Interface|Partner"
+
+# SR-Linux Leaf 側
+show interface lag1 detail | grep MTU
+show interface irb0 all | grep "IP MTU"
+
+# MTU 疎通確認 (フラグメント禁止で大きなパケットを送信)
+ping -M do -s 8900 10.20.0.254   # VXLAN 考慮した MTU テスト
+ping -M do -s 1400 10.20.0.254   # ContainerLab 環境での確認
+```
+
+> **注意**: ContainerLab/VMware 環境では NIC MTU が 1500 に制限されるため
+> 上記の Jumbo Frame 設定は適用不要です。物理 Proxmox 環境への移行時に適用してください。
 
 ---
 

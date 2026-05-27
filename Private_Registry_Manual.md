@@ -1,7 +1,7 @@
 # Private Registry セットアップマニュアル
 
 **Docker Registry v2 / Ubuntu 24.04 LTS / kubeadm + containerd v1.7.x 環境向け**
-Version 1.1
+Version 1.2
 
 ---
 
@@ -226,16 +226,34 @@ docker tag  ghcr.io/srl-labs/alpine \
 docker push 192.168.30.50:5000/srl-labs/alpine
 ```
 
-### 4.5 XRd (参考)
+### 4.5 XRd (tarball からの登録)
 
-XRd は Cisco の認証が必要です。事前に `docker login` を済ませてから実施します。
+XRd は tarball 形式で配布されます。tar の中に tgz が含まれているため以下の手順で登録します。
 
 ```bash
-docker login <cisco-registry>
-docker pull <cisco-registry>/xrd/xrd-control-plane:<tag>
-docker tag  <cisco-registry>/xrd/xrd-control-plane:<tag> \
-            192.168.30.50:5000/xrd/xrd-control-plane:<tag>
-docker push 192.168.30.50:5000/xrd/xrd-control-plane:<tag>
+# tarball の内容を確認
+tar tf xrd-control-plane-container-x86_64.<version>.tar
+
+# tar を展開
+tar xf xrd-control-plane-container-x86_64.<version>.tar
+
+# 展開された tgz を docker にロード
+docker load -i xrd-control-plane-container-x86_64.<version>.tgz
+
+# ロードされたイメージ名を確認
+docker images | grep xrd
+
+# Private Registry にタグ付けして Push
+XRD_IMAGE=$(docker images | grep xrd | awk '{print $1}')
+XRD_TAG=$(docker images | grep xrd | awk '{print $2}')
+
+docker tag  ${XRD_IMAGE}:${XRD_TAG} \
+            192.168.30.50:5000/xrd/xrd-control-plane:${XRD_TAG}
+docker push 192.168.30.50:5000/xrd/xrd-control-plane:${XRD_TAG}
+
+# 確認
+curl http://192.168.30.50:5000/v2/xrd/xrd-control-plane/tags/list | \
+  python3 -m json.tool
 ```
 
 ### 4.6 kube-vip
@@ -273,6 +291,29 @@ containerd が Private Registry をミラーとして使用するよう設定し
 ### 5.1 certs.d ディレクトリの作成
 
 containerd v1.7.x では `hosts.toml` ファイルでレジストリごとのミラーを設定します。
+
+設定が必要なケースは以下の2種類です。
+
+| ケース | 設定内容 |
+|---|---|
+| `ghcr.io/nokia/srlinux` 等の外部イメージを Private Registry からミラーして取得 | 外部レジストリ名のディレクトリに hosts.toml を作成 |
+| `192.168.30.50:5000/xrd/...` 等の Private Registry に直接登録したイメージを取得 | Private Registry の IP:Port のディレクトリに hosts.toml を作成 |
+
+> ⚠ **Private Registry への直接アクセス設定が不足すると** `.clab.yml` で `192.168.30.50:5000/xrd/...` と指定しても HTTPS エラーや Pull 失敗が発生します。
+
+```bash
+# 【必須】Private Registry への直接アクセス設定
+# HTTP + 証明書スキップを明示的に設定する
+sudo mkdir -p /etc/containerd/certs.d/192.168.30.50:5000
+
+sudo tee /etc/containerd/certs.d/192.168.30.50:5000/hosts.toml <<EOF
+server = "http://192.168.30.50:5000"
+
+[host."http://192.168.30.50:5000"]
+  capabilities = ["pull", "resolve", "push"]
+  skip_verify = true
+EOF
+```
 
 ```bash
 # ghcr.io のミラー設定

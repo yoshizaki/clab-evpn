@@ -47,7 +47,7 @@ get_nodes_json() {
 }
 
 # IPv4 アドレスからサブネットプレフィックスを除去 (例: 172.20.20.3/24 → 172.20.20.3)
-strip_prefix() { echo "${1%%/*}"; }
+strip_prefix() { echo "${1%/[0-9]*}"; }
 
 # ─── ノード一覧表示 & 選択 ───────────────────────────────────────────────────
 select_node() {
@@ -71,7 +71,7 @@ select_node() {
       "$((i+1))" "$name" "$ip" "$state" "$kind"
     names+=("$name")
     ips+=("$ip")
-    ((i++))
+    i=$((i+1))
   done < <(echo "$nodes_json" \
     | jq -r '.[] | [.name, .ipv4_address, .state, .kind] | @tsv')
 
@@ -183,7 +183,7 @@ main() {
         while IFS= read -r l; do
           printf "  ${CYAN}%d${RESET}  %s\n" "$idx" "$l"
           lab_arr+=("$l")
-          ((idx++))
+          idx=$((idx+1))
         done <<< "$labs"
         echo ""
         read -rp "  ラボの番号を入力 [1-${lab_count}]: " lc

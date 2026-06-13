@@ -3,12 +3,39 @@
 > 対象設計書: Proxmox VEを中心とした仮想化基盤構築 全体アーキテクチャ設計書 v1.4  
 > 検証環境: Ubuntu 24.04 on VMware Workstation  
 > SR-Linux: Spine×2 / Leaf×2 / BGP EVPN-VXLAN / ESI-LAG All-Active / Route-leak比較  
-> ContainerLab: v0.73.0 / SR-Linux: 25.10.1
+> ContainerLab: v0.76.0 / SR-Linux: 26.3.2
 
 ### 変更履歴
 
 | 版 | 変更内容 |
 |---|---|
+| v2.9 | Section 1 トポロジー図を刷新 (2026-06-13) |
+| | leaf が4回再掲され分かりにくかった図を Mermaid 図 + ASCII 版に置換 |
+| | 各ノードを1回ずつ表示・ESI-LAG 二重接続を明示・VLAN230 (proxy-ARP) も反映 |
+| | P2Pリンク / アクセスポートを表形式に整理 (図=構造・表=詳細に分離) |
+| v2.8 | BFD / Graceful Restart 障害挙動検証を追加 (2026-06-13) |
+| | Section 16 新規: BFD と GR の関係・効果測定 (A/B/C 比較) |
+| | 実測: リンク断は BFD で再収束 (無効時は障害区間全断)、|
+| | 単一経路の bgp_mgr 再起動は GR なし97%損失 → GRあり0.35%損失 |
+| | **重要**: ECMP+GR で本物のリンク障害を入れると死路が stale 保持され |
+| | ブラックホール化 (76%損失) → GR は configs から削除し無効が結論 |
+| | 知見: ContainerLab の BFD は 1s にクランプ (実機は設定どおり300ms) |
+| | 知見: GR ヘルパーは BFD 起因のセッション断でも stale 保持して再収束を妨げる |
+| v2.7 | Proxy-ARP (ARP Suppression) 検証追加 (2026-06-13) |
+| | Section 15 新規: メリット・効果測定方法 (A/B 比較)・実測結果 |
+| | L2専用ドメイン追加: VLAN 230 / VNI 50040 / mac-vrf-l2 (leaf1/leaf2, server-clab/clab2) |
+| | 制約判明: IRB 付き mac-vrf には proxy-arp 設定不可 (7220 D2L、コミット拒否) |
+| | 実測: リモートサーバ着信 ARP 4パケット → 0 (疎通影響なし) |
+| v2.6 | イメージピン止め・eBGPデフォルトポリシー設計見直し (2026-06-13) |
+| | topology: srlinux `latest` → `26.3.2`、network-multitool → digest 固定 |
+| | 全ノード: `ebgp-default-policy import/export-reject-all false` を削除 |
+| | (全グループ・afi-safi に明示ポリシーがあるため RFC 8212 デフォルトに戻す) |
+| | 変更後の再デプロイで End-to-End 全疎通・ESI-LAG ×4 Up・VRF間分離を再確認 |
+| v2.5 | ContainerLab 0.76.0 / SR-Linux 26.3.2 で再検証 (2026-06-13) |
+| | コンフィグ変更なしで全機能動作確認 |
+| | Underlay eBGP+BFD / EVPN / ESI-LAG All-Active ×4 全て正常 |
+| | End-to-End 疎通確認: Anycast GW・IRB 個別アドレス・サーバ間 (両テナント) 全疎通 |
+| | VRF 間分離 (route-leak なし時の不通) も期待どおり動作 |
 | v2.4 | MTU 設計詳細化 |
 | | Section 14.3: Interface MTU / IP MTU の違いを説明追加 |
 | | Section 14.3: VLAN tag オーバーヘッド考慮した MTU スタック詳細化 |
@@ -105,47 +132,105 @@
 12. [障害シナリオテスト](#12-障害シナリオテスト)
 13. [トラブルシューティング](#13-トラブルシューティング)
     - [13.5 Running Config の保存](#135-running-config-の保存)
+14. [Proxmox (Debian) 物理環境向け設定手順](#14-proxmox-debian-物理環境向け設定手順)
+15. [Proxy-ARP (ARP Suppression) 検証](#15-proxy-arp-arp-suppression-検証)
+16. [BFD と Graceful Restart の障害挙動検証](#16-bfd-と-graceful-restart-の障害挙動検証)
 
 ---
 
 ## 1. 検証トポロジー概要
 
-```
-           [server-clab]       [server-clab2]    [server-fwd]      [server-fwd2]
-           10.20.0.101         10.20.0.102        10.100.0.201      10.100.0.202
-           GW:10.20.0.254      GW:10.20.0.254     GW:10.100.0.254   GW:10.100.0.254
-           (tenant-clab)       (tenant-clab)      (tenant-fwd)      (tenant-fwd)
-                │                   │                  │                  │
-        ESI-LAG bond0.210   ESI-LAG bond0.210  ESI-LAG bond0.220  ESI-LAG bond0.220
-        (lag1/ES-BOND0)     (lag3/ES-BOND2)    (lag2/ES-BOND1)    (lag4/ES-BOND3)
-          ┌────╱╲────┐         ┌────╱╲────┐     ┌────╱╲────┐       ┌────╱╲────┐
-          │          │         │          │     │          │       │          │
-       leaf1       leaf2    leaf1       leaf2 leaf1      leaf2  leaf1       leaf2
-       D2L-1       D2L-2
-       AS 65101    AS 65102
-       Lo:10.0.1.1 Lo:10.0.1.2
-       Anycast GW: 10.20.0.254 / 10.100.0.254 (両Leaf共通)
-          │  ╲            ╱  │
-          │   ╲          ╱   │
-          │    ╲ 100G  100G  │
-          │     ╲          ╱ │
-       spine1             spine2
-       D3L-1              D3L-2
-       AS 65001           AS 65002
-       Lo: 10.0.0.1       Lo: 10.0.0.2
+各ノードは1回ずつ登場し、ESI-LAG の二重接続 (各サーバ → leaf1/leaf2) を太線で表す。
+Mermaid 対応ビューア (GitHub / VS Code 等) では下図がそのまま描画される。
 
-P2Pリンク:
-  spine1 eth1/1 ↔ leaf1 eth1/1 : 10.1.0.0/31
-  spine1 eth1/2 ↔ leaf2 eth1/1 : 10.1.0.2/31
-  spine2 eth1/1 ↔ leaf1 eth1/2 : 10.1.0.4/31
-  spine2 eth1/2 ↔ leaf2 eth1/2 : 10.1.0.6/31
+```mermaid
+graph TD
+    S1["spine1<br/>AS 65001 / Lo 10.0.0.1"]
+    S2["spine2<br/>AS 65002 / Lo 10.0.0.2"]
+    L1["leaf1 (VTEP)<br/>AS 65101 / Lo 10.0.1.1<br/>Anycast GW 10.20.0.254 / 10.100.0.254"]
+    L2["leaf2 (VTEP)<br/>AS 65102 / Lo 10.0.1.2<br/>Anycast GW 10.20.0.254 / 10.100.0.254"]
 
-アクセスポート (802.1q trunk):
-  leaf1 e1-3 + leaf2 e1-3 → server-clab  (lag1/ES-BOND0 / VLAN 210 / tenant-clab-vrf)
-  leaf1 e1-4 + leaf2 e1-4 → server-fwd   (lag2/ES-BOND1 / VLAN 220 / tenant-fwd-vrf)
-  leaf1 e1-5 + leaf2 e1-5 → server-clab2 (lag3/ES-BOND2 / VLAN 210 / tenant-clab-vrf)
-  leaf1 e1-6 + leaf2 e1-6 → server-fwd2  (lag4/ES-BOND3 / VLAN 220 / tenant-fwd-vrf)
+    S1 ---|"10.1.0.0/31"| L1
+    S1 ---|"10.1.0.2/31"| L2
+    S2 ---|"10.1.0.4/31"| L1
+    S2 ---|"10.1.0.6/31"| L2
+
+    SC["server-clab<br/>tenant-clab VLAN210<br/>10.20.0.101<br/>(+L2 VLAN230 10.30.0.101)"]
+    SC2["server-clab2<br/>tenant-clab VLAN210<br/>10.20.0.102<br/>(+L2 VLAN230 10.30.0.102)"]
+    SF["server-fwd<br/>tenant-fwd VLAN220<br/>10.100.0.201"]
+    SF2["server-fwd2<br/>tenant-fwd VLAN220<br/>10.100.0.202"]
+
+    L1 ===|"lag1 / ES-BOND0"| SC
+    L2 ===|"lag1 / ES-BOND0"| SC
+    L1 ===|"lag3 / ES-BOND2"| SC2
+    L2 ===|"lag3 / ES-BOND2"| SC2
+    L1 ===|"lag2 / ES-BOND1"| SF
+    L2 ===|"lag2 / ES-BOND1"| SF
+    L1 ===|"lag4 / ES-BOND3"| SF2
+    L2 ===|"lag4 / ES-BOND3"| SF2
+
+    classDef spine fill:#dae8fc,stroke:#6c8ebf;
+    classDef leaf  fill:#d5e8d4,stroke:#82b366;
+    classDef srv   fill:#ffe6cc,stroke:#d79b00;
+    class S1,S2 spine;
+    class L1,L2 leaf;
+    class SC,SC2,SF,SF2 srv;
 ```
+
+Mermaid 非対応ビューア向けの ASCII 版 (Leaf を 2 本のレールとして描き、各サーバが両 Leaf に接続することを示す):
+
+```
+=====================  Fabric (eBGP underlay + EVPN overlay, 全リンク BFD)  =====================
+
+        spine1                                                   spine2
+       AS 65001                                                 AS 65002
+      Lo 10.0.0.1                                              Lo 10.0.0.2
+          │ │                                                      │ │
+          │ └────────────── 10.1.0.2/31 ────────────┐             │ │
+   10.1.0.0/31                                       │      10.1.0.6/31
+          │         ┌──────── 10.1.0.4/31 ───────────┼─────────────┘ │
+          │         │ (フルメッシュ: 各 Leaf は両 Spine へ)            │
+        leaf1 ◀─────┘                                 └───────────▶ leaf2
+       AS 65101                                                 AS 65102
+      Lo 10.0.1.1  VTEP                                        Lo 10.0.1.2  VTEP
+      Anycast GW: 10.20.0.254 (VLAN210) / 10.100.0.254 (VLAN220) ← 両 Leaf 共通
+
+==================  Access (ESI-LAG All-Active: 各サーバは leaf1+leaf2 両方へ)  ==================
+
+   leaf1 ●━━━━━━━━━●━━━━━━━━━●━━━━━━━━━●        ← e1/3   e1/5   e1/4   e1/6
+         ┃         ┃         ┃         ┃
+   leaf2 ●━━━━━━━━━●━━━━━━━━━●━━━━━━━━━●        ← e1/3   e1/5   e1/4   e1/6
+         ┃         ┃         ┃         ┃
+     ┌───┸───┐ ┌───┸────┐ ┌──┸────┐ ┌──┸────┐
+     │server-│ │server- │ │server-│ │server-│
+     │ clab  │ │ clab2  │ │ fwd   │ │ fwd2  │
+     ├───────┤ ├────────┤ ├───────┤ ├───────┤
+     │VLAN210│ │VLAN210 │ │VLAN220│ │VLAN220│   tenant VLAN
+     │.20.101│ │.20.102 │ │100.201│ │100.202│   IP (末尾)
+     │ lag1  │ │ lag3   │ │ lag2  │ │ lag4  │   bond
+     │ BOND0 │ │ BOND2  │ │ BOND1 │ │ BOND3 │   ESI
+     └───────┘ └────────┘ └───────┘ └───────┘
+       └─ server-clab / clab2 は VLAN230 (mac-vrf-l2 / GWなし / proxy-ARP検証) も保持 ─┘
+```
+
+**P2Pリンク (Spine側=偶数 .0/.2/.4/.6 / Leaf側=奇数 .1/.3/.5/.7)**
+
+| リンク | Spine側 ポート/IP | Leaf側 ポート/IP | サブネット |
+|---|---|---|---|
+| spine1 ↔ leaf1 | e1/1 / 10.1.0.0 | e1/1 / 10.1.0.1 | 10.1.0.0/31 |
+| spine1 ↔ leaf2 | e1/2 / 10.1.0.2 | e1/1 / 10.1.0.3 | 10.1.0.2/31 |
+| spine2 ↔ leaf1 | e1/1 / 10.1.0.4 | e1/2 / 10.1.0.5 | 10.1.0.4/31 |
+| spine2 ↔ leaf2 | e1/2 / 10.1.0.6 | e1/2 / 10.1.0.7 | 10.1.0.6/31 |
+
+**アクセスポート (802.1q trunk / ESI-LAG All-Active)**
+
+| サーバ | Leaf ポート (両Leaf) | lag / ESI | VLAN / VRF |
+|---|---|---|---|
+| server-clab | e1/3 | lag1 / ES-BOND0 | VLAN210 / tenant-clab-vrf |
+| server-clab2 | e1/5 | lag3 / ES-BOND2 | VLAN210 / tenant-clab-vrf |
+| server-fwd | e1/4 | lag2 / ES-BOND1 | VLAN220 / tenant-fwd-vrf |
+| server-fwd2 | e1/6 | lag4 / ES-BOND3 | VLAN220 / tenant-fwd-vrf |
+| server-clab / clab2 (追加) | 同上 (lag1.230 / lag3.230) | mac-vrf-l2 | VLAN230 / L2のみ (proxy-ARP) |
 
 ### VNI割り当て (設計書 §3.2 準拠)
 
@@ -221,11 +306,11 @@ containerlab version
 ### 2.4 SR-Linux コンテナイメージ取得
 
 ```bash
-# Nokia公式イメージをpull (最新安定版)
-docker pull ghcr.io/nokia/srlinux:latest
+# Nokia公式イメージをpull (本ガイド検証バージョンにピン止め推奨)
+docker pull ghcr.io/nokia/srlinux:26.3.2
 
-# または特定バージョン (推奨: 24.x系)
-docker pull ghcr.io/nokia/srlinux:24.10.1
+# latest はメジャーバージョンを跨いで変わるため検証環境では非推奨
+# docker pull ghcr.io/nokia/srlinux:latest
 
 # イメージ確認
 docker images | grep srlinux
@@ -287,9 +372,9 @@ mgmt:
 topology:
   kinds:
     nokia_srlinux:
-      image: ghcr.io/nokia/srlinux:latest
+      image: ghcr.io/nokia/srlinux:26.3.2
     linux:
-      image: ghcr.io/hellt/network-multitool:latest
+      image: ghcr.io/hellt/network-multitool@sha256:a8d96c19e593e227d7b16d320a04256ba00434028f0adb9f7da206bf098c7140
 
   nodes:
     # ===== Spine Layer =====
@@ -353,6 +438,10 @@ topology:
         - ip link set bond0.210 up
         - ip addr add 10.20.0.101/16 dev bond0.210
         - ip route replace default via 10.20.0.254 dev bond0.210
+        # VLAN 230: proxy-ARP 検証用 L2専用セグメント (mac-vrf-l2 / GWなし)
+        - ip link add link bond0 name bond0.230 type vlan id 230
+        - ip link set bond0.230 up
+        - ip addr add 10.30.0.101/24 dev bond0.230
         - bash -c "echo 'nameserver 10.20.0.10' > /etc/resolv.conf"
 
     # tenant-fwd-vrf テスト用 (ESI-LAG All-Active)
@@ -398,6 +487,10 @@ topology:
         - ip link set bond0.210 up
         - ip addr add 10.20.0.102/16 dev bond0.210
         - ip route replace default via 10.20.0.254 dev bond0.210
+        # VLAN 230: proxy-ARP 検証用 L2専用セグメント (mac-vrf-l2 / GWなし)
+        - ip link add link bond0 name bond0.230 type vlan id 230
+        - ip link set bond0.230 up
+        - ip addr add 10.30.0.102/24 dev bond0.230
         - bash -c "echo 'nameserver 10.20.0.10' > /etc/resolv.conf"
 
     # tenant-fwd-vrf 追加サーバ (10.100.0.202 / lag4 / ESI-BOND3)
@@ -516,8 +609,6 @@ set / network-instance default interface ethernet-1/2.0
 # --- BGP Underlay (eBGP to Leaf-1 and Leaf-2) ---
 set / network-instance default protocols bgp autonomous-system 65001
 set / network-instance default protocols bgp router-id 10.0.0.1
-set / network-instance default protocols bgp ebgp-default-policy import-reject-all false
-set / network-instance default protocols bgp ebgp-default-policy export-reject-all false
 # BGPグローバルレベルでのafi-safi有効化 (必須)
 set / network-instance default protocols bgp afi-safi ipv4-unicast admin-state enable
 set / network-instance default protocols bgp afi-safi evpn admin-state enable
@@ -616,8 +707,6 @@ set / network-instance default interface ethernet-1/2.0
 
 set / network-instance default protocols bgp autonomous-system 65002
 set / network-instance default protocols bgp router-id 10.0.0.2
-set / network-instance default protocols bgp ebgp-default-policy import-reject-all false
-set / network-instance default protocols bgp ebgp-default-policy export-reject-all false
 # BGPグローバルレベルでのafi-safi有効化 (必須)
 set / network-instance default protocols bgp afi-safi ipv4-unicast admin-state enable
 set / network-instance default protocols bgp afi-safi evpn admin-state enable
@@ -955,8 +1044,6 @@ set / routing-policy policy EXPORT-LOOPBACK statement 10 action policy-result ac
 set / routing-policy policy IMPORT-ALL default-action policy-result accept
 set / network-instance default protocols bgp autonomous-system 65101
 set / network-instance default protocols bgp router-id 10.0.1.1
-set / network-instance default protocols bgp ebgp-default-policy import-reject-all false
-set / network-instance default protocols bgp ebgp-default-policy export-reject-all false
 # BGPグローバルレベルでのafi-safi有効化 (必須)
 set / network-instance default protocols bgp afi-safi ipv4-unicast admin-state enable
 # ECMP: spine1/spine2 の2経路を同時使用 (eBGP multipath)
@@ -1269,8 +1356,6 @@ set / routing-policy policy IMPORT-ALL default-action policy-result accept
 
 set / network-instance default protocols bgp autonomous-system 65102
 set / network-instance default protocols bgp router-id 10.0.1.2
-set / network-instance default protocols bgp ebgp-default-policy import-reject-all false
-set / network-instance default protocols bgp ebgp-default-policy export-reject-all false
 # BGPグローバルレベルでのafi-safi有効化 (必須)
 set / network-instance default protocols bgp afi-safi ipv4-unicast admin-state enable
 # ECMP: spine1/spine2 の2経路を同時使用 (eBGP multipath)
@@ -1899,9 +1984,11 @@ ping network-instance default 10.1.0.0   # leaf1 から spine1 へ
 # 3. BGP ログ確認
 show log bgp | grep neighbor
 
-# 4. eBGP default policy の確認 (reject-allになっていると繋がらない)
-show network-instance default protocols bgp | grep ebgp-default
-# ebgp-default-policy を false にしているか確認
+# 4. export/import ポリシーの確認
+# 本構成は ebgp-default-policy (RFC 8212: ポリシー未設定時 reject) をデフォルトのまま使い、
+# 各 BGP グループ・afi-safi に明示的に export/import ポリシーを設定している。
+# ポリシーの付け漏れがあるとそのAFのルートは交換されない。
+info flat network-instance default protocols bgp group | grep policy
 ```
 
 #### EVPN ルートが学習されない
@@ -2274,6 +2361,310 @@ ping -M do -s 1400 10.20.0.254   # ContainerLab 環境での確認
 
 ---
 
+## 15. Proxy-ARP (ARP Suppression) 検証
+
+> SR-Linux 26.3.2 / ContainerLab 0.76.0 で実機検証済み (2026-06-13)
+
+### 15.1 メリット
+
+EVPN-VXLAN ファブリックで mac-vrf の proxy-ARP を有効にすると、VTEP (leaf) が
+ARP 要求に代理応答し、ARP ブロードキャストの BUM フラッディングを抑止できる。
+
+| 観点 | 効果 |
+|---|---|
+| ファブリック帯域 | ARP broadcast が VXLAN ingress replication で全リモート VTEP に複製されなくなる。VTEP 数 N に対し O(N) のコピーが 0 になる |
+| サーバ負荷 | 同一 L2 ドメインの全サーバに届いていた ARP broadcast が届かなくなる (NIC/カーネル割り込み削減)。大規模テナントほど効果大 |
+| 応答遅延 | リモートホスト往復ではなくローカル VTEP が即時応答 |
+| 障害域の縮小 | ARP ストーム等の L2 イベントがファブリックを越えて伝搬しにくくなる |
+
+テーブルは「ローカル ARP snooping (dynamic-learning)」と「EVPN Type-2 MAC+IP ルート」の
+2 経路で構築されるため、リモートホストのエントリも BGP 経由で自動的に揃う。
+
+### 15.2 制約: IRB 付き mac-vrf には設定不可 (重要)
+
+7220 IXR-D2L (本ラボの leaf) では、**IRB をアタッチした mac-vrf に proxy-arp を
+設定するとコミットが拒否される**:
+
+```
+Error in /network-instance[name=mac-vrf-clab]/interface[name=irb0.210]/name:
+    IRB interfaces cannot be configured with proxy-arp
+```
+
+つまり VLAN 210/220 (Symmetric IRB 構成) には適用できない。IRB 構成では
+`irb arp learn-unsolicited / evpn advertise dynamic` (Section 5.3) がルーティング側の
+ARP 学習を担う。proxy-ARP は **IRB を持たない純 L2 テナント**向けの機能であるため、
+本検証では L2 専用ドメイン (VLAN 230 / VNI 50040 / mac-vrf-l2) を追加して検証する。
+なお 26.3 では 7250 IXR Gen 2c+/Gen 3 向けに L2 proxy-ARP/ND の対応が拡大している。
+
+### 15.3 追加設定
+
+サーバ側 (topology.yaml の exec、server-clab / server-clab2):
+
+```yaml
+        - ip link add link bond0 name bond0.230 type vlan id 230
+        - ip link set bond0.230 up
+        - ip addr add 10.30.0.101/24 dev bond0.230   # clab2 は .102
+```
+
+leaf1/leaf2 (`configs/leafX.cfg` に追記済み。originating-ip / rd は leaf2 では 10.0.1.2):
+
+```
+set / interface lag1 subinterface 230 admin-state enable
+set / interface lag1 subinterface 230 type bridged
+set / interface lag1 subinterface 230 vlan encap single-tagged vlan-id 230
+set / interface lag3 subinterface 230 admin-state enable
+set / interface lag3 subinterface 230 type bridged
+set / interface lag3 subinterface 230 vlan encap single-tagged vlan-id 230
+
+set / tunnel-interface vxlan0 vxlan-interface 50040 type bridged
+set / tunnel-interface vxlan0 vxlan-interface 50040 ingress vni 50040
+set / tunnel-interface vxlan0 vxlan-interface 50040 egress source-ip use-system-ipv4-address
+
+set / network-instance mac-vrf-l2 type mac-vrf
+set / network-instance mac-vrf-l2 admin-state enable
+set / network-instance mac-vrf-l2 interface lag1.230
+set / network-instance mac-vrf-l2 interface lag3.230
+set / network-instance mac-vrf-l2 vxlan-interface vxlan0.50040
+set / network-instance mac-vrf-l2 bridge-table mac-learning admin-state enable
+# Proxy-ARP 本体: snooping + EVPN Type-2 でテーブル構築し VTEP が代理応答
+set / network-instance mac-vrf-l2 bridge-table proxy-arp admin-state enable
+set / network-instance mac-vrf-l2 bridge-table proxy-arp dynamic-learning admin-state enable
+
+set / network-instance mac-vrf-l2 protocols bgp-evpn bgp-instance 1 admin-state enable
+set / network-instance mac-vrf-l2 protocols bgp-evpn bgp-instance 1 vxlan-interface vxlan0.50040
+set / network-instance mac-vrf-l2 protocols bgp-evpn bgp-instance 1 evi 50040
+set / network-instance mac-vrf-l2 protocols bgp-evpn bgp-instance 1 ecmp 2
+set / network-instance mac-vrf-l2 protocols bgp-evpn bgp-instance 1 routes bridge-table inclusive-mcast advertise true
+set / network-instance mac-vrf-l2 protocols bgp-evpn bgp-instance 1 routes bridge-table inclusive-mcast originating-ip 10.0.1.1
+set / network-instance mac-vrf-l2 protocols bgp-evpn bgp-instance 1 routes bridge-table mac-ip advertise true
+set / network-instance mac-vrf-l2 protocols bgp-vpn bgp-instance 1 route-distinguisher rd 10.0.1.1:50040
+set / network-instance mac-vrf-l2 protocols bgp-vpn bgp-instance 1 route-target export-rt target:65000:50040
+set / network-instance mac-vrf-l2 protocols bgp-vpn bgp-instance 1 route-target import-rt target:65000:50040
+```
+
+### 15.4 効果測定方法 (A/B 比較)
+
+測定指標: **「リモートサーバに着信する ARP パケット数」**。proxy-ARP の本質は
+「ARP broadcast をファブリックの手前 (ingress VTEP) で止める」ことなので、
+リモートサーバの tcpdump が最も直接的な観測点になる。
+
+```bash
+# --- A: proxy-ARP 無効時のベースライン ---
+# 1. 観測側: server-clab2 で ARP をキャプチャ (15秒)
+docker exec clab-bgp-evpn-vxlan-server-clab2 timeout 15 tcpdump -eni bond0.230 arp &
+
+# 2. 送信側: ARP キャッシュを消してから ping (新規 ARP 解決を強制)
+docker exec clab-bgp-evpn-vxlan-server-clab \
+  bash -c "ip neigh flush dev bond0.230; ping -c 3 10.30.0.102"
+
+# --- proxy-ARP 有効化 (leaf1/leaf2) ---
+docker exec -i clab-bgp-evpn-vxlan-leaf1 sr_cli <<'EOF'
+enter candidate
+set / network-instance mac-vrf-l2 bridge-table proxy-arp admin-state enable
+set / network-instance mac-vrf-l2 bridge-table proxy-arp dynamic-learning admin-state enable
+commit now
+EOF
+# (leaf2 も同様)
+
+# --- テーブル学習のシード: 一度 ARP 交換を発生させる ---
+docker exec clab-bgp-evpn-vxlan-server-clab \
+  bash -c "ip neigh flush dev bond0.230; ping -c 2 10.30.0.102"
+
+# --- proxy-ARP テーブル確認 (両ホストが origin dynamic で載ること) ---
+docker exec clab-bgp-evpn-vxlan-leaf1 sr_cli \
+  "info from state network-instance mac-vrf-l2 bridge-table proxy-arp"
+
+# --- B: proxy-ARP 有効時の測定 (A と同一手順) ---
+# 観測側 tcpdump → 送信側 flush + ping の順で再実行し、着信 ARP 数を比較する
+
+# --- 統計でも確認可能 ---
+docker exec clab-bgp-evpn-vxlan-leaf1 sr_cli \
+  "info from state network-instance mac-vrf-l2 bridge-table proxy-arp statistics"
+```
+
+判定基準:
+- ping が双方向とも成功すること (機能影響なし)
+- 送信側の `ip neigh show` で正しい MAC が解決されていること (leaf が本来の MAC で代理応答)
+- 観測側の着信 ARP が 0 になること
+
+### 15.5 実測結果 (SR-Linux 26.3.2)
+
+| 測定 | server-clab2 着信 ARP | ping 結果 |
+|---|---|---|
+| A: proxy-ARP 無効 | **4 パケット** (Request broadcast 着信 + 自身が Reply、逆方向も同様) | 3/3 成功 |
+| B: proxy-ARP 有効 | **0 パケット** | 3/3 成功 |
+
+- A では `Request who-has 10.30.0.102 tell 10.30.0.101` が VXLAN を越えて server-clab2 に
+  到達し、server-clab2 自身が応答していた
+- B では leaf1 が proxy テーブルから server-clab2 の実 MAC (`aa:c1:ab:8a:69:ad`) で
+  即時代理応答し、ARP はファブリックに流れない。送信側の ARP キャッシュは
+  `10.30.0.102 lladdr aa:c1:ab:8a:69:ad REACHABLE` と正しく解決
+- leaf1 proxy-ARP statistics: `total-entries 2 / active-entries 2` (origin dynamic)
+- 参考: IRB 構成の VLAN 210 で同一測定を行うと proxy-ARP が設定できないため
+  常に A と同じ結果 (4 パケット着信) になる
+
+再デプロイ後の再測定では、ESI-LAG のハッシュにより ARP が leaf2 側に流れたため
+**leaf2 が origin dynamic で学習し、leaf1 には EVPN Type-2 経由で origin evpn として
+2 エントリが伝搬**することを確認。どちらの leaf が受信しても代理応答が成立する
+(着信 ARP 0 パケット・疎通影響なし) ことを再現確認済み。
+
+> **運用ノート**: `configs/*.cfg` を変更した場合、`containerlab deploy` だけでは
+> ラボディレクトリに保存済みの旧 config.json から起動してしまい反映されない。
+> **`containerlab deploy --reconfigure`** で再デプロイすること。
+
+---
+
+## 16. BFD と Graceful Restart の障害挙動検証
+
+> SR-Linux 26.3.2 / ContainerLab 0.76.0 で実機検証済み (2026-06-13)
+
+### 16.1 結論 (本ラボでは GR は無効が正しい)
+
+BFD と Graceful Restart (GR) は **正反対の障害**を対象とする。
+
+| | BFD | Graceful Restart |
+|---|---|---|
+| 対象 | データプレーン (リンク・転送パス) の障害 | コントロールプレーン (BGPプロセス) の再起動 |
+| 望む挙動 | 即セッション断 → **死路を撤去して再収束** | セッション断でも **ルートを stale 保持して転送維持** |
+| 前提 | パスが本当に死んでいる | ASIC は生きておりパケットは流れ続ける |
+
+**本ラボのような全 ECMP + BFD ファブリックでは GR を有効にすべきでない。** 実測 (16.5) の通り:
+
+- GR ヘルパーは **GR ネゴ済み peer とのセッションが切れると、切断理由を問わず
+  (BFD 起因のハード障害でも) 受信ルートを stale として保持し続ける**。
+  → 本物のリンク障害でも死路が ECMP に stale で残り、そこへハッシュされた flow が
+  **`stale-routes-time` (既定 360s) までブラックホール化**する。
+- 一方その GR の利点 (プロセス再起動の無停止化) は、**ECMP が既に提供している**
+  (16.4 B-1: GR なしでもプロセス再起動は 0.4% 損失)。
+- つまり ECMP 環境で GR は **利得ほぼゼロ・リンク障害時の害は実在**。差し引きで無効が正しい。
+
+> **訂正記録**: 初版では「BFD の fast-failover が GR を素通りさせるので GR を入れても安全」と
+> 記載したが、実測 (16.5) でこれは **誤り**と判明した。BFD はセッションを落とすが、
+> GR ヘルパーはその落ちたセッションのルートを stale 保持してしまい、再収束を妨げる。
+
+GR が有効なのは **ECMP 代替経路を持たない単一ホーム区間**や、計画的な ISSU/プロセス
+再起動を無停止化したい場合に限られる (16.4 B-2)。本ラボは全区間 ECMP のため非該当。
+
+以下、この結論に至った実測を示す。
+
+### 16.2 検証手段
+
+- **測定器**: leaf1 のアンダーレイ netns から leaf2 ループバックへ 10pps の連続 ping。
+  これは確実にスパインを越える経路 (leaf1 → spine → leaf2)。損失パケット数 × 0.1s ≒ 断時間。
+  ```bash
+  docker exec clab-bgp-evpn-vxlan-leaf1 \
+    ip netns exec srbase-default ping -i 0.1 -w 30 -W 1 10.0.1.2
+  ```
+- **リンク障害注入** (リンクは UP のまま転送だけ止める = BFD の出番を作る):
+  ```bash
+  docker exec clab-bgp-evpn-vxlan-leaf1 tc qdisc add dev e1-2 root netem loss 100%
+  docker exec clab-bgp-evpn-vxlan-leaf1 tc qdisc del dev e1-2 root   # 復旧
+  # ※ containerlab tools netem set -n leaf1 -i e1-2 --loss 100 でも可
+  ```
+- **BGPプロセス再起動** (ウォーム再起動):
+  ```bash
+  docker exec clab-bgp-evpn-vxlan-spine2 \
+    sr_cli "tools system app-management application bgp_mgr restart"
+  ```
+
+### 16.3 シナリオ A: リンク/パス障害 (BFD の効果)
+
+アクティブな spine 経路を `netem loss 100%` で塞ぐ (インターフェースは oper-up のまま)。
+
+| 測定 | 損失 | 断時間 | 挙動 |
+|---|---|---|---|
+| A1: **BFD 有効** | 48/206 = 23% | **約 4.8s** | BFD 検出 → fast-failover → もう一方の spine へ再収束 |
+| A2: **BFD 無効** | 131/168 = 78% | 障害区間 14s **全断** | リンク UP のため BGP が気付かず再収束しない (実機ではホールドタイマ 90s まで継続) |
+
+- BFD 無効ではインターフェースが UP のままなので next-hop は「到達可能」と見なされ、
+  flow は塞がれた経路へ送られ続けてブラックホール化する。BFD が「リンクは上がっているが
+  転送が死んでいる」障害を検出する価値がここに出る。
+
+> **重要な実機との差異 (ContainerLab)**: 設定上の BFD タイマは 100ms × 3 = 300ms だが、
+> ソフトウェア BFD では負の影響を避けるため **negotiated interval が 1 秒にクランプ**される
+> (`active-transmit-interval / active-receive-interval = 1000000µs`)。
+> よって検出は 1s × 3 = **約 3 秒**となり、A1 の約 4.8s 断 (検出 + 再収束) と整合する。
+> 物理 7220 ハードウェアでは設定どおり 300ms 検出となり、断は ~数百 ms に収まる。
+> 確認: `info from state bfd` の `active-receive-interval` を参照。
+
+### 16.4 シナリオ B: BGPプロセス再起動 (GR の効果)
+
+`bgp_mgr` をウォーム再起動し、転送が維持されるかを測定する。
+
+#### B-1: 冗長 (ECMP) ありの場合
+
+spine2 の `bgp_mgr` を再起動 (leaf1→leaf2 は spine1/spine2 の ECMP):
+
+| 測定 | 損失 | 挙動 |
+|---|---|---|
+| GR なし + ECMP | 1/236 = 0.4% | ほぼ無停止。ただし **GR の効果ではなく ECMP** が即座に spine1 へ吸収しただけ |
+
+→ **冗長構成では単一ノードのプロセス再起動は ECMP だけでほぼ無停止**になり、GR の効果は隠れる。
+
+#### B-2: 単一経路に縮退して GR の効果を分離
+
+leaf1 の spine1 リンクを落として **spine2 単一経路**にし (`ethernet-1/1 admin-state disable`)、
+spine2 の `bgp_mgr` を再起動:
+
+| 測定 | 損失 | 断時間 | 挙動 |
+|---|---|---|---|
+| **GR なし** | 271/279 = **97%** | 約 27s 全断 | セッション断で leaf1 がルートを撤去 → 代替なしでブラックホール、セッション再確立まで継続 |
+| **GR あり** | 1/283 = **0.35%** | 約 0.1s | leaf1 が peer の再起動を検知 (`number-of-restarts 1`) し **ルートを stale 保持**、spine2 は転送継続 → ほぼ無停止 |
+
+→ 代替経路がない条件では GR の有無が **97% 損失 → 0.35% 損失**の差を生む。
+これが GR の利点だが、**ECMP がある本ラボでは ECMP が同じ役割を既に果たす** (B-1) ため
+この利点は出ない。
+
+### 16.5 シナリオ C: GR 有効 + ECMP で本物のリンク障害 (= ブラックホール)
+
+「ECMP があれば GR は安全」かを直接検証する。GR を全ノードで有効化したまま、
+アクティブ spine 経路を `netem loss 100%` で塞ぐ (16.3 A と同一手順)。
+
+| 測定 (e1-2 を塞ぐ) | 損失 | 障害中の 10.0.1.2 ルート | 判定 |
+|---|---|---|---|
+| **GR 有効** | 158/207 = **76%** | `u*>` spine1 / **`ux*>` spine2 (stale 保持)** | 死路が ECMP に残り**ブラックホール継続** |
+| **GR 無効** | 86/281 = 30% | `u*>` spine1 のみ (**死路を撤去**) | spine1 へ再収束し回復 |
+
+決定的な違いは**ルートテーブルの状態**:
+
+```
+# GR 有効・障害中: 死んだ spine2 経路が stale フラグ付きで FIB に残存
+| u*>   | 10.0.1.2/32 | 10.1.0.0 |  ...   ← spine1 (生存)
+| ux*>  | 10.0.1.2/32 | 10.1.0.4 |  ...   ← spine2 (stale=x だが used=u のまま転送)
+BGP neighbor 10.1.0.4: connect   ← BFD はセッションを正しく落としている
+
+# GR 無効・障害中: 死路は即撤去され spine1 のみ
+| u*>   | 10.0.1.2/32 | 10.1.0.0 |  ...   ← spine1 へクリーンに再収束
+```
+
+- BFD は両ケースとも spine2 セッションを正しく `connect` (down) にしている。
+  しかし **GR ヘルパーがその down したセッションのルートを stale 保持**し、ECMP の死路として
+  転送に残してしまう。これが ECMP 環境で GR がブラックホールを生むメカニズム。
+- なお `bgp_mgr` ウォーム再起動 (B) では BFD は無フラップ (`failure-transitions 0`) で
+  セッションが維持されるため GR が機能した。**「セッションが切れたか否か」が分岐点**であり、
+  リンク障害ではセッションが切れる以上、GR は stale 保持側に倒れて害になる。
+
+### 16.6 設定 (本ラボの結論: GR は無効)
+
+検証の結果、GR は **configs から削除し無効**とした。リンク障害対策は BFD が担当する。
+
+```
+# graceful-restart は設定しない (ECMP 環境ではリンク障害時にブラックホールを生むため)
+# リンク障害 → BFD fast-failover で死路を撤去し ECMP 再収束 (Section 5 / 16.3)
+# プロセス再起動 → ECMP が吸収 (16.4 B-1)
+```
+
+| 区間の性質 | 推奨 | 理由 |
+|---|---|---|
+| ECMP 冗長あり (本ラボ全区間) | **GR 無効** | プロセス再起動は ECMP が吸収、GR はリンク障害でブラックホール化 |
+| 単一ホーム/冗長なし | GR 有効も可 | プロセス再起動を無停止化でき、リンク障害は元々代替なしなので GR の害が増えない |
+
+> **運用ノート**: GR を使う場合は `stale-routes-time` を短く設定し、BFD でセッションを
+> 確実に落として stale を早期に flush する設計が必須。ECMP ファブリックでは GR を入れず
+> BFD + ECMP に任せるのが堅実。
+
+---
+
 ## 付録: アドレス体系まとめ
 
 | ノード | AS | Loopback (VTEP) | P2P (spine1) | P2P (spine2) |
@@ -2294,3 +2685,4 @@ ping -M do -s 1400 10.20.0.254   # ContainerLab 環境での確認
 |---|---|---|---|
 | tenant-clab-vrf | 10.20.0.1/16 | 10.20.0.2/16 | 10.20.0.101 |
 | tenant-fwd-vrf | 10.100.0.1/24 | 10.100.0.2/24 | 10.100.0.201 |
+| mac-vrf-l2 (L2のみ / proxy-ARP / VLAN 230) | - | - | 10.30.0.101 / 10.30.0.102 |
